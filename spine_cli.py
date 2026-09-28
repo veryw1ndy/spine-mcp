@@ -7,7 +7,10 @@ project back to runtime, and print project info. We drive it via subprocess.
 from __future__ import annotations
 import os, subprocess
 
-SPINE_BIN = os.environ.get("SPINE_BIN", "/Applications/Spine.app/Contents/MacOS/Spine")
+# Local setup: the native Spine.app binary must never be invoked from this server.
+SPINE_BIN = os.environ.get("SPINE_BIN", os.path.expanduser("~/spine-probe/spine-cli"))
+if SPINE_BIN.startswith("/Applications/Spine.app"):
+    raise RuntimeError("The native Spine.app binary must not be used")
 _NOISE = ("Spine Launcher", "Esoteric Software", "Mac OS X", "Starting:",
           "Spine 4.3", "Licensed to:")
 
@@ -16,7 +19,8 @@ def available() -> bool:
     return os.path.exists(SPINE_BIN)
 
 
-def _run(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
+def _run(args: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
+    # Longer default timeout: every wrapper run starts Spine under Wine (~15 s).
     return subprocess.run([SPINE_BIN, *args], capture_output=True, text=True, timeout=timeout)
 
 
