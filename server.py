@@ -75,7 +75,11 @@ def rig_and_animate(source: str, out_dir: str, name: str = "", kind: str = "symb
     out_dir       where to write <name>.json/.atlas/.png (e.g. a game's
                   static/assets/spine/<name>/)
     name          skeleton name (defaults to the source basename)
-    kind          "symbol" or "mascot" (reserved; both rig the same body+head now)
+    kind          "symbol" or "mascot" (reserved; both rig the same way now)
+                  Layers named as limbs (arm_l, forearm_r, hand_l, thigh_r,
+                  shin_l, foot_r, 左大臂, 右小腿 ...) get bone chains with joints
+                  found from the art; see spine_rig.LIMB_WORDS. The summary
+                  lists them under "limbs" and any skipped layers under "warnings".
     anims         subset of ["idle","win","blink","pop"] (default all applicable)
     make_editable also emit an editable <name>.spine next to the source (Spine CLI)
 

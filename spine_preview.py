@@ -1,20 +1,42 @@
 """spine_preview — render a keyframe-montage PNG of a rig's animations WITHOUT a
 browser or game. Composites atlas parts at chosen anim times applying bone
-translate/rotate/scale + attachment swaps. Not pivot-exact (parts rotate about
-their image centre, the runtime pivots about bones) — a fast sanity check of
-assembly, draw order and face-swaps, not a final render.
+translate/rotate/scale + attachment swaps. Bone transforms are inherited down
+the hierarchy as affine matrices, so parts pivot about their bones like the
+runtime (limb chains need that). Keys are interpolated linearly, so curves are
+approximated — a fast check of assembly, draw order and poses, not a final render.
 """
 from __future__ import annotations
-import json, os
+import json, math, os
 from PIL import Image, ImageDraw
 
 
-def _bone_world(bones, name):
-    X = Y = 0.0
-    n = name
-    while n and n != "root":
-        b = bones[n]; X += b.get("x", 0); Y += b.get("y", 0); n = b.get("parent")
-    return X, Y
+def _affine(x, y, rot, sx, sy):
+    """3x3 matrix for translate(x, y) · rotate(rot degrees) · scale(sx, sy)."""
+    c, s = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+    return [[c * sx, -s * sy, x], [s * sx, c * sy, y], [0.0, 0.0, 1.0]]
+
+
+def _mul(a, b):
+    return [[sum(a[r][k] * b[k][c] for k in range(3)) for c in range(3)] for r in range(3)]
+
+
+def _inv(m):
+    a, b, tx = m[0]; c, d, ty = m[1]
+    det = a * d - b * c
+    ia, ib, ic, id_ = d / det, -b / det, -c / det, a / det
+    return [[ia, ib, -(ia * tx + ib * ty)], [ic, id_, -(ic * tx + id_ * ty)], [0.0, 0.0, 1.0]]
+
+
+def _bone_worlds(bones_list, bd):
+    """World matrix per bone: setup transform + animation offsets, parent first."""
+    W = {}
+    for b in bones_list:
+        e = bd.get(b["name"], {"rot": 0, "tx": 0, "ty": 0, "sx": 1, "sy": 1})
+        local = _affine(b.get("x", 0) + e["tx"], b.get("y", 0) + e["ty"], b.get("rotation", 0) + e["rot"],
+                        b.get("scaleX", 1) * e["sx"], b.get("scaleY", 1) * e["sy"])
+        p = b.get("parent")
+        W[b["name"]] = _mul(W[p], local) if p else local
+    return W
 
 
 def _lerp(kf, t):
@@ -34,10 +56,12 @@ def _lerp(kf, t):
 
 
 def _render(d, images_dir, anim, t, maxpx):
-    sk = d["skeleton"]; bones = {b["name"]: b for b in d["bones"]}
+    sk = d["skeleton"]
     slots = d["slots"]; att = d["skins"][0]["attachments"]; A = d["animations"][anim]
     W, H = int(sk["width"]), int(sk["height"])
-    cv = Image.new("RGBA", (W, H), (24, 20, 32, 255))
+    pad = int(0.2 * max(W, H))   # room for limbs swung past the setup bounds
+    CW, CH = W + 2 * pad, H + 2 * pad
+    cv = Image.new("RGBA", (CW, CH), (24, 20, 32, 255))
     cur = {s["name"]: s.get("attachment") for s in slots}
     for sn, ad in A.get("slots", {}).items():
         if "attachment" in ad:
@@ -56,6 +80,7 @@ def _render(d, images_dir, anim, t, maxpx):
         if "scale" in tl:
             v = _lerp(tl["scale"], t); e["sx"], e["sy"] = v.get("x", 1), v.get("y", 1)
         bd[bn] = e
+    worlds = _bone_worlds(d["bones"], bd)
     for s in slots:
         region = cur[s["name"]]
         if not region:
@@ -69,15 +94,16 @@ def _render(d, images_dir, anim, t, maxpx):
         if (im.width, im.height) != (ent.get("width", im.width), ent.get("height", im.height)):
             im = im.resize((max(1, int(ent.get("width", im.width))),
                             max(1, int(ent.get("height", im.height)))), Image.LANCZOS)
-        bx, by = _bone_world(bones, s["bone"]); e = bd.get(s["bone"], {"rot": 0, "tx": 0, "ty": 0, "sx": 1, "sy": 1})
-        if e["sx"] != 1 or e["sy"] != 1:
-            im = im.resize((max(1, int(im.width * e["sx"])), max(1, int(im.height * e["sy"]))))
-        if e["rot"]:
-            im = im.rotate(e["rot"], expand=True, resample=Image.BICUBIC)
-        px = bx + ent.get("x", 0) + e["tx"]; py = by + ent.get("y", 0) + e["ty"]
-        cv.alpha_composite(im, (int(px + W / 2 - im.width / 2), int(H - py - im.height / 2)))
-    sc = maxpx / max(W, H)
-    return cv.resize((max(1, int(W * sc)), max(1, int(H * sc))))
+        # image pixel (u, v) → attachment local → bone world → canvas pixel
+        to_att = [[1.0, 0.0, -im.width / 2], [0.0, -1.0, im.height / 2], [0.0, 0.0, 1.0]]
+        att_m = _affine(ent.get("x", 0), ent.get("y", 0), ent.get("rotation", 0), 1, 1)
+        to_canvas = [[1.0, 0.0, W / 2 + pad], [0.0, -1.0, H + pad], [0.0, 0.0, 1.0]]
+        m = _mul(to_canvas, _mul(worlds[s["bone"]], _mul(att_m, to_att)))
+        inv = _inv(m)
+        warped = im.transform((CW, CH), Image.AFFINE, (*inv[0], *inv[1]), resample=Image.BICUBIC)
+        cv.alpha_composite(warped)
+    sc = maxpx / max(CW, CH)
+    return cv.resize((max(1, int(CW * sc)), max(1, int(CH * sc))))
 
 
 # default poses to sample per animation (time in seconds)

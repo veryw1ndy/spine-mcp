@@ -13,14 +13,23 @@ Rig: body(root) + head(neck) [+ rot]; collar/fire ride the body. Head-state
 families (head/head_win/head_blink or face/face_win/face_blink) collapse into ONE
 slot with attachment-swap inside the win/blink timelines.
 
+Limb layers (see LIMB_WORDS) get a bone chain per side: upper_arm → forearm →
+hand on the body, thigh → shin → foot on a `hips` bone. Joints come from each
+part's opaque pixels, so angled limbs pivot correctly. With legs present, hips
+becomes the parent of body and legs and carries every body translate, so a jump
+lifts the legs too; rotate and squash stay on the upper body. Without limb
+layers the output is exactly the body + head rig above.
+
 Anims: idle(loop) · win(squash-stretch pop + face-swap) · blink(face-swap) ·
 pop(squash landing). One-shots end at the setup pose so they mix back cleanly.
+Arms sway in idle and swing outward in win.
 
 This is the engine behind the Spine MCP server's `rig_and_animate` tool; it is a
 pure function (no MCP, no globals) so it can also be imported or run standalone.
 """
 from __future__ import annotations
-import json, os, glob
+import json, math, os, glob, re
+import numpy as np
 from PIL import Image
 
 SUFFIX = ("_win", "_blink")
@@ -95,15 +104,98 @@ HEAD_WORDS = tuple(
 )
 
 
+# Which part names count as limb segments. There is no team naming spec for limb
+# layers yet, so this table is the contract. English names are split into words
+# ("upper_arm_l", "LeftForearm", "hand-R") and matched word by word, so "armor" or
+# "charm" never count as an arm. Chinese names are matched as substrings, longest
+# first. A side word is optional; without one the side comes from which half of
+# the torso the part sits on ("l" = viewer's left, same as the layer names).
+LIMB_WORDS = {
+    "upperarm": ("arm", 0), "arm": ("arm", 0),
+    "forearm": ("arm", 1), "lowerarm": ("arm", 1),
+    "hand": ("arm", 2),
+    "thigh": ("leg", 0), "upperleg": ("leg", 0), "leg": ("leg", 0),
+    "shin": ("leg", 1), "calf": ("leg", 1), "lowerleg": ("leg", 1),
+    "foot": ("leg", 2),
+}
+LIMB_ZH = (("手臂", "arm", 0), ("胳膊", "arm", 0), ("大臂", "arm", 0), ("上臂", "arm", 0),
+           ("小臂", "arm", 1), ("前臂", "arm", 1), ("大腿", "leg", 0), ("小腿", "leg", 1),
+           ("手", "arm", 2), ("臂", "arm", 0), ("腿", "leg", 0), ("脚", "leg", 2), ("足", "leg", 2))
+# Both limbs painted on one layer cannot get a bone each; it stays on the body.
+MERGED_LIMB_WORDS = ("arms", "legs")
+MERGED_LIMB_ZH = ("双臂", "双腿", "两腿", "双手")
+SIDE_WORDS = {"l": "l", "left": "l", "r": "r", "right": "r", "front": "front", "back": "back"}
+SEG_NAMES = {"arm": ("upper_arm", "forearm", "hand"), "leg": ("thigh", "shin", "foot")}
+TORSO_WORDS = ("body", "torso", "chest", "身体", "躯干")
+
+
+def _words(name: str) -> list[str]:
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+    w = [t for t in re.split(r"[^a-z]+", s.lower()) if t]
+    out, i = [], 0
+    while i < len(w):   # glue "upper arm" / "lower leg" into one word
+        if i + 1 < len(w) and w[i] in ("upper", "lower") and w[i + 1] in ("arm", "leg"):
+            out.append(w[i] + w[i + 1]); i += 2
+        else:
+            out.append(w[i]); i += 1
+    return out
+
+
+def _limb_of(name: str):
+    """{"limb", "seg", "side"} for a limb layer, "merged" for a both-limbs layer,
+    None otherwise. side may be None (resolved later from position)."""
+    words = _words(name)
+    if any(w in MERGED_LIMB_WORDS for w in words) or any(k in name for k in MERGED_LIMB_ZH):
+        return "merged"
+    hit = next((LIMB_WORDS[w] for w in words if w in LIMB_WORDS), None)
+    if hit is None:
+        hit = next(((limb, seg) for k, limb, seg in LIMB_ZH if k in name), None)
+    if hit is None:
+        return None
+    side = next((SIDE_WORDS[w] for w in words if w in SIDE_WORDS), None)
+    if side is None:
+        side = "l" if "左" in name else "r" if "右" in name else None
+    return {"limb": hit[0], "seg": hit[1], "side": side}
+
+
 def _classify(name: str, state_bases) -> str:
     s = name.lower()
     if s in state_bases:
         return "head"
     if any(k in s for k in HEAD_WORDS):
         return "head"
+    if isinstance(_limb_of(name), dict):
+        return "limb"
     if "rot" in s:
         return "rot"
     return "body"
+
+
+def _limb_axis(img: Image.Image, part: dict) -> dict | None:
+    """Medial axis of a limb part from its opaque pixels, in rig coords (+Y up).
+    Each end is the outermost point along the long axis, placed across the axis
+    at the mean of the last 8 % of pixels, so it sits on the limb's centre line
+    even when the limb is drawn at an angle."""
+    alpha = np.asarray(img.getchannel("A")) > 32
+    ys, xs = np.nonzero(alpha)
+    if len(xs) < 8:
+        return None
+    sx, sy = part["w"] / img.width, part["h"] / img.height
+    X = part["cx"] - part["w"] / 2 + (xs + 0.5) * sx
+    Y = part["cy"] + part["h"] / 2 - (ys + 0.5) * sy
+    P = np.stack([X, Y], 1)
+    m = P.mean(0)
+    evals, evecs = np.linalg.eigh(np.cov((P - m).T))
+    d = evecs[:, int(np.argmax(evals))]
+    t = (P - m) @ d
+    nrm = (P - m) @ np.array([-d[1], d[0]])
+    lo, hi = float(t.min()), float(t.max())
+    band = 0.08 * (hi - lo)
+    perp = np.array([-d[1], d[0]])
+    e0 = m + d * lo + perp * float(nrm[t <= lo + band].mean())
+    e1 = m + d * hi + perp * float(nrm[t >= hi - band].mean())
+    width = float(np.percentile(nrm, 95) - np.percentile(nrm, 5))
+    return {"ends": (e0, e1), "width": width, "length": hi - lo}
 
 
 def build_rig(source: str, out_dir: str, name: str | None = None,
@@ -161,13 +253,105 @@ def build_rig(source: str, out_dir: str, name: str | None = None,
     hy = (sum(norm[n]["cy"] for n in heads) / len(heads)
           - max(norm[n]["h"] for n in heads) * 0.42) if heads else H * 0.6
     rots = [n for n in draw_final if cls[n] == "rot"]
-    BONES = {"body": ("root", 0.0, round(H * 0.30, 2))}
+    all_regions = list(norm.keys())
+    imgs = {n: Image.open(f"{images_dir}/{norm[n]['file']}.png").convert("RGBA") for n in all_regions}
+
+    # ---- limb chains ---------------------------------------------------------
+    warnings = []
+    for n in draw_final:
+        if cls[n] == "body" and _limb_of(n) == "merged":
+            warnings.append(f"{n}: both limbs on one layer, left on the body; "
+                            "split it into one layer per side to get limb bones")
+    body_parts = [n for n in draw_final if cls[n] == "body"]
+    torso = ([n for n in body_parts if any(k in n.lower() for k in TORSO_WORDS)]
+             or [n for n in body_parts if _limb_of(n) is None] or body_parts or draw_final)
+    tx0 = min(norm[n]["cx"] - norm[n]["w"] / 2 for n in torso)
+    tx1 = max(norm[n]["cx"] + norm[n]["w"] / 2 for n in torso)
+    ty0 = min(norm[n]["cy"] - norm[n]["h"] / 2 for n in torso)
+    ty1 = max(norm[n]["cy"] + norm[n]["h"] / 2 for n in torso)
+    tcx = (tx0 + tx1) / 2
+    # A chain's root end is the one nearer the shoulder line (arms) or the hip
+    # line (legs), which holds for hanging, raised and sideways limbs alike.
+    ANCHOR = {"arm": np.array([tcx, ty1]), "leg": np.array([tcx, ty0])}
+
+    chains = {}   # (limb, side) -> {seg: [part names]}
+    for n in draw_final:
+        if cls[n] != "limb":
+            continue
+        info = _limb_of(n)
+        side = info["side"] or ("l" if norm[n]["cx"] < tcx else "r")
+        chains.setdefault((info["limb"], side), {}).setdefault(info["seg"], []).append(n)
+
+    LIMB_BONE, LIMB_CHAINS, OUTWARD, limb_specs = {}, {}, {}, []
+    for (limb, side), segs in sorted(chains.items()):
+        joints = []   # (seg, members, joint, far end)
+        prev_far = None
+        for seg in sorted(segs):
+            members = segs[seg]
+            geo = max(members, key=lambda k: int((np.asarray(imgs[k].getchannel("A")) > 32).sum()))
+            ax = _limb_axis(imgs[geo], norm[geo])
+            if ax is None:
+                for k in members:
+                    cls[k] = "body"
+                warnings.append(f"{geo}: too few opaque pixels for a limb axis, left on the body")
+                continue
+            e0, e1 = ax["ends"]
+            ref = ANCHOR[limb] if prev_far is None else prev_far
+            near, far = (e0, e1) if np.linalg.norm(e0 - ref) <= np.linalg.norm(e1 - ref) else (e1, e0)
+            # Joints sit at the centre of the rounded end cap, half a limb width
+            # in from the tip; between segments, midway between the two caps,
+            # so an elbow or ankle bent at 90 degrees still lands on the joint.
+            inward = (far - near) / max(float(np.linalg.norm(far - near)), 1e-6)
+            cap = min(ax["width"] / 2, 0.3 * ax["length"])
+            near_cap, far_cap = near + inward * cap, far - inward * cap
+            joint = near_cap if prev_far is None else (prev_far_cap + near_cap) / 2
+            joints.append((seg, members, joint, far))
+            prev_far, prev_far_cap = far, far_cap
+        if not joints:
+            continue
+        single = len(joints) == 1 and joints[0][0] == 0
+        parent = "body" if limb == "arm" else "hips"
+        names = []
+        for i, (seg, members, joint, far) in enumerate(joints):
+            tip = joints[i + 1][2] if i + 1 < len(joints) else far
+            d = tip - joint
+            bn = f"{limb}_{side}" if single else f"{SEG_NAMES[limb][seg]}_{side}"
+            limb_specs.append((bn, parent, joint, math.degrees(math.atan2(d[1], d[0])),
+                               float(np.linalg.norm(d))))
+            for k in members:
+                LIMB_BONE[k] = bn
+            if i == 0:
+                u = d / max(float(np.linalg.norm(d)), 1e-6)
+                # +rotation moves the tip along (-u.y, u.x): outward when that
+                # points away from the centre line; sideways limbs raise instead
+                s = -u[1] * (tip[0] - tcx) if abs(u[1]) > 0.5 else u[0]
+                OUTWARD[bn] = 1 if s >= 0 else -1
+            names.append(bn)
+            parent = bn
+        LIMB_CHAINS[f"{limb}_{side}"] = names
+    has_legs = any(p == "hips" for _b, p, *_ in limb_specs)
+
+    # BONES[name] = world transform (x, y, rotation in degrees) + parent + length
+    def _bone(parent, x, y, rot=0.0, length=0.0):
+        return {"parent": parent, "x": round(float(x), 2), "y": round(float(y), 2),
+                "rot": round(float(rot), 2), "length": round(float(length), 2)}
+
+    if has_legs:
+        hip_y = sum(float(j[1]) for _b, p, j, *_ in limb_specs if p == "hips") / \
+            sum(1 for _b, p, *_ in limb_specs if p == "hips")
+        BONES = {"hips": _bone("root", tcx, hip_y), "body": _bone("hips", tcx, hip_y)}
+    else:
+        BONES = {"body": _bone("root", 0.0, H * 0.30)}
     if has_head:
-        BONES["head"] = ("body", round(hx, 2), round(hy, 2))
+        BONES["head"] = _bone("body", hx, hy)
     if has_rot:
-        BONES["rot"] = ("root", round(norm[rots[0]]["cx"], 2), round(norm[rots[0]]["cy"], 2))
+        BONES["rot"] = _bone("root", norm[rots[0]]["cx"], norm[rots[0]]["cy"])
+    for bn, parent, joint, rot, length in limb_specs:
+        BONES[bn] = _bone(parent, joint[0], joint[1], rot, length)
 
     def slotbone(n):
+        if cls[n] == "limb":
+            return LIMB_BONE[n]
         if has_rot and cls[n] == "rot":
             return "rot"
         if has_head and cls[n] == "head":
@@ -175,12 +359,17 @@ def build_rig(source: str, out_dir: str, name: str | None = None,
         return "body"
 
     def bworld(n):
-        return (0.0, 0.0) if n == "root" else (BONES[n][1], BONES[n][2])
+        return (0.0, 0.0, 0.0) if n == "root" else (BONES[n]["x"], BONES[n]["y"], BONES[n]["rot"])
+
+    def to_local(x, y, frame):
+        """World point → local coords of a bone frame (x, y, rotation)."""
+        fx, fy, fr = frame
+        c, s = math.cos(math.radians(-fr)), math.sin(math.radians(-fr))
+        dx, dy = x - fx, y - fy
+        return dx * c - dy * s, dx * s + dy * c
 
     # ---- atlas (shelf-pack; region name == attachment name) ------------------
-    all_regions = list(norm.keys())
     MAXW, PAD = 1024, 2
-    imgs = {n: Image.open(f"{images_dir}/{norm[n]['file']}.png").convert("RGBA") for n in all_regions}
     # A part WIDER than the page used to be pasted anyway: PIL crops silently at
     # the page edge while the .atlas still declares the full region size, so the
     # overhanging columns sample outside the texture and the renderer clamps them
@@ -207,11 +396,12 @@ def build_rig(source: str, out_dir: str, name: str | None = None,
 
     # ---- bones / slots / skin ------------------------------------------------
     bones = [{"name": "root"}]
-    for bn, (p, bx, by) in BONES.items():
-        pw = bworld(p)
-        bones.append({"name": bn, "parent": p, "x": round(bx - pw[0], 2),
-                      "y": round(by - pw[1], 2), "rotation": 0,
-                      "scaleX": 1.0, "scaleY": 1.0, "length": 0})
+    for bn, b in BONES.items():
+        pw = bworld(b["parent"])
+        lx, ly = to_local(b["x"], b["y"], pw)
+        bones.append({"name": bn, "parent": b["parent"], "x": round(lx, 2),
+                      "y": round(ly, 2), "rotation": round(b["rot"] - pw[2], 2) or 0,
+                      "scaleX": 1.0, "scaleY": 1.0, "length": b["length"] or 0})
     GLOW = "Layer 2" if "Layer 2" in draw_final else None
     # molten lava / fire parts → additive blend so a colour pulse reads as heat
     GLOWSET = ([GLOW] if GLOW else []) + sorted(FIRE)
@@ -224,8 +414,11 @@ def build_rig(source: str, out_dir: str, name: str | None = None,
 
     def att_entry(region, host_slot):
         bw = bworld(slotbone(host_slot))
-        e = {"x": round(norm[region]["cx"] - bw[0], 2), "y": round(norm[region]["cy"] - bw[1], 2),
-             "width": int(norm[region]["w"]), "height": int(norm[region]["h"])}
+        lx, ly = to_local(norm[region]["cx"], norm[region]["cy"], bw)
+        e = {"x": round(lx, 2), "y": round(ly, 2)}
+        if bw[2]:
+            e["rotation"] = round(-bw[2], 2)
+        e.update({"width": int(norm[region]["w"]), "height": int(norm[region]["h"])})
         if region != host_slot:
             e["path"] = region
         return e
@@ -311,6 +504,35 @@ def build_rig(source: str, out_dir: str, name: str | None = None,
                                     {"time": 0.64, "x": 1.07, "y": 0.95}, {"time": 0.8, "x": 0.98, "y": 1.02},
                                     {"time": Ig, "x": 1, "y": 1}]}}}
 
+    # ---- limbs in the animations ---------------------------------------------
+    # Arms only: legs stay planted and follow the hips. Rotations are signed so
+    # "outward" means away from the body on either side.
+    for chain, names in LIMB_CHAINS.items():
+        if not chain.startswith("arm_"):
+            continue
+        s = OUTWARD[names[0]]
+        if "idle" in animations:
+            ib = animations["idle"]["bones"]
+            ib[names[0]] = {"rotate": [{"time": 0, "value": 0}, {"time": 0.9, "value": 2.5 * s},
+                                       {"time": 1.9, "value": -2 * s}, {"time": D, "value": 0}]}
+            if len(names) > 1:
+                ib[names[1]] = {"rotate": [{"time": 0, "value": 0}, {"time": 1.1, "value": 3 * s},
+                                           {"time": 2.1, "value": -2.5 * s}, {"time": D, "value": 0}]}
+        if "win" in animations:
+            wb = animations["win"]["bones"]
+            wb[names[0]] = {"rotate": [{"time": 0, "value": 0}, {"time": 0.1, "value": -6 * s},
+                                       {"time": 0.3, "value": 38 * s}, {"time": 0.5, "value": 28 * s},
+                                       {"time": Wd, "value": 0}]}
+            if len(names) > 1:
+                wb[names[1]] = {"rotate": [{"time": 0, "value": 0}, {"time": 0.34, "value": 22 * s},
+                                           {"time": 0.54, "value": 12 * s}, {"time": Wd, "value": 0}]}
+    if has_legs:
+        # a body translate on hips moves the legs with it (jumps, landings)
+        for a in animations.values():
+            t = a.get("bones", {}).get("body", {}).pop("translate", None)
+            if t:
+                a["bones"]["hips"] = {"translate": t}
+
     skel = {"skeleton": {"hash": f"spine-mcp-{name}", "spine": "4.2.00",
                          "x": round(-W / 2, 2), "y": 0, "width": round(W, 2), "height": round(H, 2),
                          "images": "./", "audio": ""},
@@ -322,5 +544,6 @@ def build_rig(source: str, out_dir: str, name: str | None = None,
         "bones": [b["name"] for b in bones], "slots": [s["name"] for s in slots],
         "head_slot": HEAD_SLOT, "variants": list(STATE_FAM.get(HEAD_SLOT, {})) if HEAD_SLOT else [],
         "anims": list(animations),
+        "limbs": LIMB_CHAINS, "warnings": warnings,
         "files": {"json": f"{out_dir}/{name}.json", "atlas": f"{out_dir}/{name}.atlas", "png": f"{out_dir}/{name}.png"},
     }
